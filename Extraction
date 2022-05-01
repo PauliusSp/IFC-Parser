@@ -1,0 +1,283 @@
+import json
+import logging
+import os
+import traceback
+import ifcopenshell
+import uuid
+from ifcopenshell.util.selector import Selector
+
+ifc_file = ifcopenshell.open('/path/to/your/file.ifc') 
+print('IFC reading successfully completed')
+
+def process(ifc_file):
+    print(ifc_file.schema)
+
+    query = """
+        .IfcWall[Pset_WallCommon.IsExternal = "True"] |
+        .IfcDoor |
+        .IfcCurtainWall |
+        .IfcSlab |
+        .IfcRoof |
+        .IfcPlate |
+        .IfcWindow |
+        .IfcCovering
+    """
+
+    types = {}
+    building_elements = []
+
+    selector = Selector()
+    elements = selector.parse(ifc_file, query)
+
+    for element in elements:
+        print(element.GlobalId + " - " + element.Name)
+        properties = extract_properties(element, "Analytical Properties")
+        print(properties)
+
+        final = {
+            "id": element.GlobalId,
+            "type": element.is_a(),
+            "name": element.Name,
+            "description": getattr(element, "Description", None),
+            "object_type": element.ObjectType,
+            "area": properties.get("area"),
+            "volume": properties.get("volume"),
+            "thickness": properties.get("thickness"),
+        }
+
+        building_elements.append(final)
+
+    for element in elements:
+        if element.ObjectType not in types:
+            material = extract_product_materials(element)
+            properties = extract_properties(element)
+
+            if "materials" in material:
+                material["heat_transfer_coefficient"] = properties.get("heat_transfer_coefficient")
+
+            types[element.ObjectType] = {
+                "id": str(uuid.uuid4()),
+                "object_type": element.ObjectType,
+                "ifc_building_element_type": element.is_a(),
+                "material_data": material,
+                "material_type": "Layered" if "layers" in material else "Standard"
+            }
+
+    return {
+       "types": types,
+       "elements": building_elements
+   }
+
+def update_project_status(project_id, owner_id, status):
+    print("Updating status: " + status)
+    table = dynamodb.Table(os.environ["PROJECT_TABLE_NAME"])
+
+    table.update_item(
+        Key={
+            'id': project_id,
+            'owner_id': owner_id
+        },
+        UpdateExpression='SET #status = :status',
+        ExpressionAttributeNames={
+            '#status': "status"
+        },
+        ExpressionAttributeValues={
+            ':status': status
+        }
+    )
+
+def extract_properties(product, analytical_properties_key="Analytical Properties"):
+
+    volume = 0
+    area = 0
+    thermal_resistance = 0
+    heat_transfer_coefficient = 0
+
+    def extract_values(property_definition):
+
+        nonlocal area, volume, thermal_resistance, heat_transfer_coefficient
+
+        if property_definition.is_a('IfcPropertySet'):
+            if property_definition.Name == "Dimensions":
+                for p in property_definition.HasProperties:
+                    if p.is_a('IfcPropertySingleValue'):
+                        if p.Name == "Area":
+                            area = p.NominalValue.wrappedValue
+                        if p.Name == "Volume":
+                            volume = p.NominalValue.wrappedValue
+
+            if property_definition.Name == analytical_properties_key:
+                for p in property_definition.HasProperties:
+                    if p.Name == "Thermal Resistance (R)":
+                        thermal_resistance = p.NominalValue.wrappedValue
+
+                    if p.Name == "Heat Transfer Coefficient (U)":
+                        heat_transfer_coefficient = p.NominalValue.wrappedValue
+
+    if product.IsDefinedBy:
+        for definition in product.IsDefinedBy:
+            # In IFC2X3 this could be property or type
+            # in IFC4 type is in inverse attribute IsTypedBy
+            if definition.is_a('IfcRelDefinesByProperties'):
+                property_definition = definition.RelatingPropertyDefinition
+                extract_values(property_definition)
+
+            if definition.is_a('IfcRelDefinesByType'):
+                type_object = definition.RelatingType
+                if type_object.HasPropertySets:
+                    for property_definition in type_object.HasPropertySets:
+                        extract_values(property_definition)
+
+    if product.IsTypedBy:
+        for definition in product.IsTypedBy:
+            if definition.is_a('IfcRelDefinesByType'):
+                type_object = definition.RelatingType
+                if type_object.HasPropertySets:
+                    for property_definition in type_object.HasPropertySets:
+                        extract_values(property_definition)
+
+    if area == 0 or volume == 0 or thermal_resistance == 0 or heat_transfer_coefficient == 0:
+        print("Missing information to complete calculation")
+        print("Area: " + str(area))
+        print("Volume: " + str(volume))
+        print("Thermal Resistance: " + str(thermal_resistance))
+        return {
+           'area': 0,
+           'thickness': 0,
+           'volume': 0,
+           'thermal_resistance': 0,
+           'thermal_conductivity': 0,
+           'heat_transfer_coefficient': 0
+
+       }
+
+    thickness = volume / area
+    thermal_conductivity = (thickness / thermal_resistance)
+
+    return {
+        'area': area,
+        'thickness': thickness,
+        'volume': volume,
+        'thermal_resistance': thermal_resistance,
+        'thermal_conductivity': thermal_conductivity,
+        'heat_transfer_coefficient': heat_transfer_coefficient
+    }
+
+
+def extract_product_materials(product):
+
+    definition = {}
+
+    for assoc in product.HasAssociations:
+        if assoc.is_a("IfcRelAssociatesMaterial"):
+
+            # https://standards.buildingsmart.org/IFC/RELEASE/IFC2x3/TC1/HTML/ifcproductextension/lexical/ifcrelassociatesmaterial.htm
+            # https://standards.buildingsmart.org/IFC/RELEASE/IFC2x3/TC1/HTML/ifcmaterialresource/lexical/ifcmaterialselect.htm
+
+            material_select = assoc.RelatingMaterial
+
+            # IfcMaterial
+            if material_select.is_a("IfcMaterial"):
+                definition = {
+                    "materials": [
+                        extract_material(material_select)
+                    ]
+                }
+
+            # IfcMaterialList
+            elif material_select.is_a("IfcMaterialList"):
+                materials = []
+                for material in material_select.Materials:
+                    extracted = extract_material(material)
+                    if extracted == None:
+                        continue
+                    materials.append(extracted)
+
+                definition = materials
+
+            # IfcMaterialLayerSetUsage
+            elif material_select.is_a("IfcMaterialLayerSetUsage"):
+                definition = {
+                    "layers": extract_material_layers(material_select.ForLayerSet.MaterialLayers)
+                }
+
+            # IfcMaterialLayerSet
+            elif material_select.is_a("IfcMaterialLayerSet"):
+                definition = {
+                    "layers": extract_material_layers(material_select.MaterialLayers)
+                }
+
+            # IfcMaterialLayer
+            elif material_select.is_a("IfcMaterialLayer"):
+                definition = {
+                    "layers": [
+                        extract_material_layer(material_select)
+                    ]
+                }
+
+            # IfcMaterialConstituentSet
+            elif material_select.is_a("IfcMaterialConstituentSet"):
+                definition = {
+                    "materials": extract_material_constituents(material_select)
+                }
+
+            # IfcMaterialConstituent
+            elif material_select.is_a("IfcMaterialConstituent"):
+                definition = {
+                    "materials": [
+                        extract_material_constituent(material_select)
+                    ]
+                }
+
+            else:
+                print("No handler defined for material type.")
+                print(material_select.is_a())
+
+    return definition
+
+def extract_material_layers(layers):
+    extracted_layers = []
+    for layer in layers:
+        extracted = extract_material_layer(layer)
+        if extracted == None:
+            continue
+        extracted_layers.append(extracted)
+
+    return extracted_layers
+
+
+def extract_material_constituent(constituent):
+    return extract_material(constituent.Material),
+
+
+def extract_material_constituents(constituent_set):
+    extracted_constituents = []
+    for constituent in constituent_set.MaterialConstituents:
+        extracted = extract_material(constituent.Material)
+        extracted_constituents.append(extracted)
+    return extracted_constituents
+
+
+def extract_material(material):
+    if material == None:
+        return None
+
+    return {
+        "id": str(uuid.uuid4()),
+        "name": getattr(material, 'Name', None),
+        "description": getattr(material, 'Description', None),
+    }
+
+
+def extract_material_layer(layer):
+    material = None
+    if getattr(layer, "Material", None):
+        material = extract_material(layer.Material)
+
+    return {
+        "id": str(uuid.uuid4()),
+        "thickness": layer.LayerThickness,
+        "material": material
+    }
+result = process(ifc_file)
+print(result)
