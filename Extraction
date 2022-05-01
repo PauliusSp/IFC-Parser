@@ -279,5 +279,4 @@ def extract_material_layer(layer):
         "thickness": layer.LayerThickness,
         "material": material
     }
-result = process(ifc_file)
-print(result)
+
